@@ -247,12 +247,17 @@ func TestStartNoCapabilities(t *testing.T) {
 	})
 }
 
-func TestSetCapabilitiesErrorsBeforeStart(t *testing.T) {
+func TestSetCapabilitiesBeforeStartSkipsValidation(t *testing.T) {
 	testClients(t, func(t *testing.T, client OpAMPClient) {
 		capabilities := coreCapabilities | protobufs.AgentCapabilities_AgentCapabilities_ReportsAvailableComponents
 		setCapabilityErr := client.SetCapabilities(&capabilities)
-		assert.Error(t, setCapabilityErr)
-		assert.Contains(t, setCapabilityErr.Error(), "AvailableComponents is nil")
+		require.NoError(t, setCapabilityErr, "SetCapabilities before Start does not run validateCapabilities")
+
+		require.NoError(t, client.SetAgentDescription(createAgentDescr()))
+		settings := createNoServerSettings()
+		prepareSettings(t, &settings, client)
+		startErr := client.Start(context.Background(), settings)
+		assert.ErrorIs(t, startErr, internal.ErrAvailableComponentsMissing)
 	})
 }
 
@@ -605,16 +610,11 @@ func TestFirstStatusReport(t *testing.T) {
 	})
 }
 
-func TestIncludesDetailsOnReconnect(t *testing.T) {
+func TestExcludesDetailsOnReconnect(t *testing.T) {
 	srv := internal.StartMockServer(t)
-
-	seqNum := 0
 
 	var receivedDetails int64
 	srv.OnMessage = func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
-		assert.EqualValues(t, seqNum, msg.SequenceNum)
-		seqNum++
-
 		// Track when we receive AgentDescription
 		if msg.AgentDescription != nil {
 			atomic.AddInt64(&receivedDetails, 1)
@@ -641,13 +641,14 @@ func TestIncludesDetailsOnReconnect(t *testing.T) {
 	eventually(t, func() bool { return atomic.LoadInt64(&connected) == 1 })
 	eventually(t, func() bool { return atomic.LoadInt64(&receivedDetails) == 1 })
 
-	// close the Agent connection. expect it to reconnect and send details again.
+	// close the Agent connection. expect it to reconnect without sending details.
 	require.NotNil(t, client.conn)
 	err := client.conn.Close()
 	assert.NoError(t, err)
 
 	eventually(t, func() bool { return atomic.LoadInt64(&connected) == 2 })
-	eventually(t, func() bool { return atomic.LoadInt64(&receivedDetails) == 2 })
+	// AgentDescription should NOT be sent again on reconnect.
+	assert.Never(t, func() bool { return atomic.LoadInt64(&receivedDetails) >= 2 }, 500*time.Millisecond, 10*time.Millisecond)
 
 	err = client.Stop(context.Background())
 	assert.NoError(t, err)
@@ -792,17 +793,19 @@ func TestAgentIdentification(t *testing.T) {
 	testClients(t, func(t *testing.T, client OpAMPClient) {
 		// Start a server.
 		srv := internal.StartMockServer(t)
-		newInstanceUid := genNewInstanceUid(t)
+		var newInstanceUid atomic.Value
+		newInstanceUid.Store(genNewInstanceUid(t))
 		var rcvAgentInstanceUid atomic.Value
 		srv.OnMessage = func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
 			if msg.Flags&uint64(protobufs.AgentToServerFlags_AgentToServerFlags_RequestInstanceUid) == 1 {
-				newInstanceUid = genNewInstanceUid(t)
-				rcvAgentInstanceUid.Store(newInstanceUid[:])
+				uid := genNewInstanceUid(t)
+				newInstanceUid.Store(uid)
+				rcvAgentInstanceUid.Store(uid[:])
 				return &protobufs.ServerToAgent{
 					InstanceUid: msg.InstanceUid,
 					AgentIdentification: &protobufs.AgentIdentification{
 						// If the RequestInstanceUid flag was set, populate this field.
-						NewInstanceUid: newInstanceUid[:],
+						NewInstanceUid: uid[:],
 					},
 				}
 			}
@@ -860,7 +863,7 @@ func TestAgentIdentification(t *testing.T) {
 				if !ok {
 					return false
 				}
-				return types.InstanceUid(instanceUid) == newInstanceUid
+				return types.InstanceUid(instanceUid) == newInstanceUid.Load().(types.InstanceUid)
 			},
 		)
 
@@ -2705,15 +2708,231 @@ func TestValidateCapabilities(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			testClients(t, func(t *testing.T, client OpAMPClient) {
-				// Setup the client state as per the test case
-				tc.setupFunc(t, client)
+				srv := internal.StartMockServer(t)
+				defer srv.Close()
 
-				// Validate capabilities
-				err := client.SetCapabilities(&tc.capabilities)
+				tc.setupFunc(t, client)
+				require.NoError(t, client.SetAgentDescription(createAgentDescr()))
+
+				// Minimal caps for PrepareStart; validateCapabilities on SetCapabilities runs only once started.
+				initialCaps := coreCapabilities
+				err := client.SetCapabilities(&initialCaps)
+				require.NoError(t, err)
+
+				settings := types.StartSettings{
+					OpAMPServerURL: "ws://" + srv.Endpoint,
+					Callbacks: types.Callbacks{
+						OnMessage: func(ctx context.Context, msg *types.MessageData) {},
+					},
+				}
+				prepareSettings(t, &settings, client)
+				require.NoError(t, client.Start(context.Background(), settings))
+
+				caps := tc.capabilities
+				err = client.SetCapabilities(&caps)
 				assert.Equal(t, tc.expectedError, err)
+
+				assert.NoError(t, client.Stop(context.Background()))
 			})
 		})
 	}
+}
+
+func TestConnectionSettingsFilteredByCapability(t *testing.T) {
+	testClients(t, func(t *testing.T, client OpAMPClient) {
+		metricsSettings := &protobufs.TelemetryConnectionSettings{DestinationEndpoint: "http://metrics.internal"}
+		tracesSettings := &protobufs.TelemetryConnectionSettings{DestinationEndpoint: "http://traces.internal"}
+		logsSettings := &protobufs.TelemetryConnectionSettings{DestinationEndpoint: "http://logs.internal"}
+		otherSettings := &protobufs.OtherConnectionSettings{DestinationEndpoint: "http://other.internal"}
+
+		srv := internal.StartMockServer(t)
+		firstMessage := true
+		srv.OnMessage = func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			if firstMessage {
+				firstMessage = false
+				return &protobufs.ServerToAgent{
+					InstanceUid: msg.InstanceUid,
+					ConnectionSettings: &protobufs.ConnectionSettingsOffers{
+						Hash:       []byte{1, 2, 3},
+						OwnMetrics: metricsSettings,
+						OwnTraces:  tracesSettings,
+						OwnLogs:    logsSettings,
+						OtherConnections: map[string]*protobufs.OtherConnectionSettings{
+							"other": otherSettings,
+						},
+					},
+				}
+			}
+			return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+		}
+
+		var gotCallback atomic.Bool
+		// Only enable ReportsOwnMetrics — traces, logs, other should be filtered out.
+		settings := types.StartSettings{
+			OpAMPServerURL: "ws://" + srv.Endpoint,
+			Callbacks: types.Callbacks{
+				OnConnectionSettings: func(ctx context.Context, offers *protobufs.ConnectionSettingsOffers) error {
+					assert.NotNil(t, offers.OwnMetrics)
+					assert.Nil(t, offers.OwnTraces, "OwnTraces should be filtered out since ReportsOwnTraces capability is not set")
+					assert.Nil(t, offers.OwnLogs, "OwnLogs should be filtered out since ReportsOwnLogs capability is not set")
+					assert.Nil(t, offers.OtherConnections, "OtherConnections should be filtered out since AcceptsOtherConnectionSettings capability is not set")
+					gotCallback.Store(true)
+					return nil
+				},
+			},
+			Capabilities: protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnMetrics,
+		}
+		prepareClient(t, &settings, client)
+		assert.NoError(t, client.Start(t.Context(), settings))
+
+		eventually(t, func() bool { return gotCallback.Load() })
+
+		srv.Close()
+		err := client.Stop(t.Context())
+		assert.NoError(t, err)
+	})
+}
+
+func TestReportFullStateIncludesConnectionSettingsStatus(t *testing.T) {
+	testClients(t, func(t *testing.T, client OpAMPClient) {
+		srv := internal.StartMockServer(t)
+		srv.EnableExpectMode()
+
+		hash := []byte{4, 5, 6}
+		connSettingsStatus := &protobufs.ConnectionSettingsStatus{
+			LastConnectionSettingsHash: hash,
+			Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+		}
+
+		capabilities := protobufs.AgentCapabilities_AgentCapabilities_ReportsEffectiveConfig |
+			protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus |
+			protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnMetrics
+		settings := types.StartSettings{
+			OpAMPServerURL:               "ws://" + srv.Endpoint,
+			Capabilities:                 capabilities,
+			LastConnectionSettingsStatus: connSettingsStatus,
+		}
+		prepareClient(t, &settings, client)
+		assert.NoError(t, client.Start(t.Context(), settings))
+
+		// First message should include ConnectionSettingsStatus.
+		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			assert.NotNil(t, msg.ConnectionSettingsStatus)
+			assert.True(t, proto.Equal(connSettingsStatus, msg.ConnectionSettingsStatus))
+			return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+		})
+
+		// Trigger a status report to get a compressed message.
+		_ = client.UpdateEffectiveConfig(t.Context())
+
+		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			// ConnectionSettingsStatus should be compressed (nil) since it hasn't changed.
+			assert.Nil(t, msg.ConnectionSettingsStatus)
+			// Ask for full state.
+			return &protobufs.ServerToAgent{
+				InstanceUid: msg.InstanceUid,
+				Flags:       uint64(protobufs.ServerToAgentFlags_ServerToAgentFlags_ReportFullState),
+			}
+		})
+
+		// Full state response should include ConnectionSettingsStatus.
+		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			assert.NotNil(t, msg.ConnectionSettingsStatus, "ReportFullState response should include ConnectionSettingsStatus")
+			assert.True(t, proto.Equal(connSettingsStatus, msg.ConnectionSettingsStatus))
+			return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+		})
+
+		srv.Close()
+		err := client.Stop(t.Context())
+		assert.NoError(t, err)
+	})
+}
+
+func TestConnectionSettingsSkippedWhenHashUnchanged(t *testing.T) {
+	testClients(t, func(t *testing.T, client OpAMPClient) {
+		hash := []byte{7, 8, 9}
+		metricsSettings := &protobufs.TelemetryConnectionSettings{DestinationEndpoint: "http://metrics.internal"}
+
+		srv := internal.StartMockServer(t)
+		srv.EnableExpectMode()
+
+		var callbackCount atomic.Int64
+		settings := types.StartSettings{
+			OpAMPServerURL: "ws://" + srv.Endpoint,
+			Callbacks: types.Callbacks{
+				OnConnectionSettings: func(ctx context.Context, offers *protobufs.ConnectionSettingsOffers) error {
+					callbackCount.Add(1)
+					return client.SetConnectionSettingsStatus(&protobufs.ConnectionSettingsStatus{
+						LastConnectionSettingsHash: offers.Hash,
+						Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+					})
+				},
+			},
+			Capabilities: protobufs.AgentCapabilities_AgentCapabilities_ReportsOwnMetrics |
+				protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus |
+				protobufs.AgentCapabilities_AgentCapabilities_ReportsEffectiveConfig,
+		}
+		prepareClient(t, &settings, client)
+		assert.NoError(t, client.Start(t.Context(), settings))
+
+		// First message from client: server offers connection settings.
+		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			return &protobufs.ServerToAgent{
+				InstanceUid: msg.InstanceUid,
+				ConnectionSettings: &protobufs.ConnectionSettingsOffers{
+					Hash:       hash,
+					OwnMetrics: metricsSettings,
+				},
+			}
+		})
+
+		// Client sends APPLYING then APPLIED status. The server responds with the
+		// same connection settings hash each time. Eventually the callback count
+		// should stabilize at 1 because the hash-skip logic prevents reprocessing.
+		srv.EventuallyExpect("client reports APPLIED status",
+			func(msg *protobufs.AgentToServer) (*protobufs.ServerToAgent, bool) {
+				resp := &protobufs.ServerToAgent{
+					InstanceUid: msg.InstanceUid,
+					ConnectionSettings: &protobufs.ConnectionSettingsOffers{
+						Hash:       hash,
+						OwnMetrics: metricsSettings,
+					},
+				}
+				applied := msg.ConnectionSettingsStatus != nil &&
+					msg.ConnectionSettingsStatus.Status == protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED
+				return resp, applied
+			},
+		)
+
+		// After APPLIED, trigger another exchange via UpdateEffectiveConfig.
+		// The server sends the same offers again — callback should NOT fire.
+		_ = client.UpdateEffectiveConfig(t.Context())
+
+		srv.Expect(func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			return &protobufs.ServerToAgent{
+				InstanceUid: msg.InstanceUid,
+				ConnectionSettings: &protobufs.ConnectionSettingsOffers{
+					Hash:       hash,
+					OwnMetrics: metricsSettings,
+				},
+			}
+		})
+
+		// The callback should have been invoked exactly once (from the first offer),
+		// and should remain stable after the repeated offer is processed.
+		require.Eventually(t, func() bool {
+			return callbackCount.Load() == 1
+		}, time.Second, 10*time.Millisecond,
+			"Callback should be invoked once for unchanged hash")
+		assert.Never(t, func() bool {
+			return callbackCount.Load() > 1
+		}, 200*time.Millisecond, 10*time.Millisecond,
+			"Callback should not be invoked again for unchanged hash")
+
+		srv.Close()
+		err := client.Stop(t.Context())
+		assert.NoError(t, err)
+	})
 }
 
 func generateTestAvailableComponents() *protobufs.AvailableComponents {
@@ -2734,4 +2953,231 @@ func generateTestAvailableComponents() *protobufs.AvailableComponents {
 			},
 		},
 	}
+}
+
+func TestSetConnectionSettingsStatus(t *testing.T) {
+	testCases := []struct {
+		name         string
+		capabilities protobufs.AgentCapabilities
+		needsServer  bool
+		testFunc     func(t *testing.T, client OpAMPClient, srv *internal.MockServer)
+	}{{
+		name:         "no capability returns error",
+		capabilities: coreCapabilities,
+		testFunc: func(t *testing.T, client OpAMPClient, _ *internal.MockServer) {
+			err := client.SetConnectionSettingsStatus(&protobufs.ConnectionSettingsStatus{
+				LastConnectionSettingsHash: []byte{1, 2, 3},
+				Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+			})
+			require.ErrorIs(t, err, internal.ErrReportsConnectionSettingsStatusNotSet)
+		},
+	}, {
+		name:         "nil status returns error",
+		capabilities: coreCapabilities | protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus,
+		testFunc: func(t *testing.T, client OpAMPClient, _ *internal.MockServer) {
+			err := client.SetConnectionSettingsStatus(nil)
+			require.Error(t, err)
+		},
+	}, {
+		name:         "nil hash returns error",
+		capabilities: coreCapabilities | protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus,
+		testFunc: func(t *testing.T, client OpAMPClient, _ *internal.MockServer) {
+			err := client.SetConnectionSettingsStatus(&protobufs.ConnectionSettingsStatus{
+				Status: protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+			})
+			require.Error(t, err)
+		},
+	}, {
+		name:         "sends status to server",
+		capabilities: coreCapabilities | protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus,
+		needsServer:  true,
+		testFunc: func(t *testing.T, client OpAMPClient, srv *internal.MockServer) {
+			gotApplied := new(atomic.Bool)
+			srv.OnMessage = func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+				if msg.ConnectionSettingsStatus != nil &&
+					msg.ConnectionSettingsStatus.Status == protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED {
+					gotApplied.Store(true)
+				}
+				return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+			}
+
+			err := client.SetConnectionSettingsStatus(&protobufs.ConnectionSettingsStatus{
+				LastConnectionSettingsHash: []byte{1, 2, 3},
+				Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+			})
+			require.NoError(t, err)
+			eventually(t, func() bool { return gotApplied.Load() })
+		},
+	}, {
+		name:         "duplicate status is no-op",
+		capabilities: coreCapabilities | protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus,
+		needsServer:  true,
+		testFunc: func(t *testing.T, client OpAMPClient, srv *internal.MockServer) {
+			var appliedCount atomic.Int64
+			srv.OnMessage = func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+				if msg.ConnectionSettingsStatus != nil &&
+					msg.ConnectionSettingsStatus.Status == protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED {
+					appliedCount.Add(1)
+				}
+				return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+			}
+
+			status := &protobufs.ConnectionSettingsStatus{
+				LastConnectionSettingsHash: []byte{1, 2, 3},
+				Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+			}
+
+			// First call should send to server.
+			err := client.SetConnectionSettingsStatus(status)
+			require.NoError(t, err)
+			eventually(t, func() bool { return appliedCount.Load() == 1 })
+
+			// Second call with identical status should be a no-op (updateStoredConnectionSettingsStatus returns false).
+			err = client.SetConnectionSettingsStatus(status)
+			require.NoError(t, err)
+
+			eventually(t, func() bool { return appliedCount.Load() == 1 })
+		},
+	}, {
+		name:         "sends FAILED status to server",
+		capabilities: coreCapabilities | protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus,
+		needsServer:  true,
+		testFunc: func(t *testing.T, client OpAMPClient, srv *internal.MockServer) {
+			gotFailed := new(atomic.Bool)
+			srv.OnMessage = func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+				if msg.ConnectionSettingsStatus != nil &&
+					msg.ConnectionSettingsStatus.Status == protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_FAILED {
+					gotFailed.Store(true)
+				}
+				return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+			}
+
+			err := client.SetConnectionSettingsStatus(&protobufs.ConnectionSettingsStatus{
+				LastConnectionSettingsHash: []byte{1, 2, 3},
+				Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_FAILED,
+				ErrorMessage:               "TLS verification failed",
+			})
+			require.NoError(t, err)
+			eventually(t, func() bool { return gotFailed.Load() })
+		},
+	}, {
+		name:         "different hash triggers send",
+		capabilities: coreCapabilities | protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus,
+		needsServer:  true,
+		testFunc: func(t *testing.T, client OpAMPClient, srv *internal.MockServer) {
+			var appliedCount atomic.Int64
+			srv.OnMessage = func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+				if msg.ConnectionSettingsStatus != nil &&
+					msg.ConnectionSettingsStatus.Status == protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED {
+					appliedCount.Add(1)
+				}
+				return &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+			}
+
+			// First call with hash A.
+			err := client.SetConnectionSettingsStatus(&protobufs.ConnectionSettingsStatus{
+				LastConnectionSettingsHash: []byte{1, 2, 3},
+				Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+			})
+			require.NoError(t, err)
+			eventually(t, func() bool { return appliedCount.Load() == 1 })
+
+			// Second call with different hash B should still send.
+			err = client.SetConnectionSettingsStatus(&protobufs.ConnectionSettingsStatus{
+				LastConnectionSettingsHash: []byte{4, 5, 6},
+				Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+			})
+			require.NoError(t, err)
+			eventually(t, func() bool { return appliedCount.Load() == 2 })
+		},
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			testClients(t, func(t *testing.T, client OpAMPClient) {
+				var srv *internal.MockServer
+				var settings types.StartSettings
+
+				if tc.needsServer {
+					srv = internal.StartMockServer(t)
+					defer srv.Close()
+					settings.OpAMPServerURL = "ws://" + srv.Endpoint
+				} else {
+					settings = createNoServerSettings()
+				}
+				settings.Capabilities = tc.capabilities
+
+				startClient(t, settings, client)
+				tc.testFunc(t, client, srv)
+
+				err := client.Stop(t.Context())
+				require.NoError(t, err)
+			})
+		})
+	}
+}
+
+// TestSetConnectionSettingsStatusAsync tests that when the server offers connection settings,
+// the client sets APPLYING automatically, and then the agent can asynchronously set APPLIED via
+// SetConnectionSettingsStatus.
+func TestSetConnectionSettingsStatusAsync(t *testing.T) {
+	testClients(t, func(t *testing.T, client OpAMPClient) {
+		hash := []byte{1, 2, 3}
+		gotApplying := new(atomic.Bool)
+		gotApplied := new(atomic.Bool)
+		callbackCalled := new(atomic.Bool)
+
+		srv := internal.StartMockServer(t)
+		defer srv.Close()
+
+		firstMessage := true
+		srv.OnMessage = func(msg *protobufs.AgentToServer) *protobufs.ServerToAgent {
+			if msg.ConnectionSettingsStatus != nil {
+				switch msg.ConnectionSettingsStatus.Status {
+				case protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLYING:
+					gotApplying.Store(true)
+				case protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED:
+					gotApplied.Store(true)
+				}
+			}
+			resp := &protobufs.ServerToAgent{InstanceUid: msg.InstanceUid}
+			if firstMessage {
+				firstMessage = false
+				resp.ConnectionSettings = &protobufs.ConnectionSettingsOffers{
+					Hash:  hash,
+					Opamp: &protobufs.OpAMPConnectionSettings{DestinationEndpoint: "http://opamp.com"},
+				}
+			}
+			return resp
+		}
+
+		capabilities := coreCapabilities |
+			protobufs.AgentCapabilities_AgentCapabilities_AcceptsOpAMPConnectionSettings |
+			protobufs.AgentCapabilities_AgentCapabilities_ReportsConnectionSettingsStatus
+		settings := types.StartSettings{
+			Capabilities:   capabilities,
+			OpAMPServerURL: "ws://" + srv.Endpoint,
+			Callbacks: types.Callbacks{
+				OnOpampConnectionSettings: func(ctx context.Context, settings *protobufs.OpAMPConnectionSettings) error {
+					callbackCalled.Store(true)
+					return nil
+				},
+			},
+		}
+		startClient(t, settings, client)
+
+		eventually(t, func() bool { return gotApplying.Load() })
+		eventually(t, func() bool { return callbackCalled.Load() })
+
+		err := client.SetConnectionSettingsStatus(&protobufs.ConnectionSettingsStatus{
+			LastConnectionSettingsHash: hash,
+			Status:                     protobufs.ConnectionSettingsStatuses_ConnectionSettingsStatuses_APPLIED,
+		})
+		require.NoError(t, err)
+
+		eventually(t, func() bool { return gotApplied.Load() })
+
+		err = client.Stop(t.Context())
+		require.NoError(t, err)
+	})
 }

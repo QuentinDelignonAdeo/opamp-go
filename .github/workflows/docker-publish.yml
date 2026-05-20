@@ -29,19 +29,19 @@ jobs:
           - dockerfile: internal/examples/Dockerfile.server
             image-name: opamp-server-example
             context: .
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -49,7 +49,7 @@ jobs:
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.image-name }}
           tags: |
@@ -59,15 +59,23 @@ jobs:
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Read Go version from internal/examples/go.mod
+        id: go-version
+        shell: bash
+        run: |
+          GO_VERSION="$(awk '$1=="go"{ split($2,v, "."); print v[1]"."v[2]; exit}' internal/examples/go.mod)"
+          echo "version=${GO_VERSION}" >> "${GITHUB_OUTPUT}"
+
       - name: Build and push Docker image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: "GO_VERSION=${{ steps.go-version.outputs.version }}"
           platforms: linux/amd64
           cache-from: type=gha
           cache-to: type=gha,mode=max
